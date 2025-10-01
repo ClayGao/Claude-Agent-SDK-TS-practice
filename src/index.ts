@@ -1,124 +1,323 @@
 /**
- * Claude Agent SDK 互動式範例
+ * Claude Agent SDK 進階互動範例
  *
- * 這個範例展示如何使用 Claude Agent SDK 建立一個可以接收使用者輸入的 AI Agent。
- * Agent 可以使用多種工具來回答問題，例如讀取檔案、執行命令等。
+ * 包含以下功能：
+ * 1. 基本查詢 - 單次問答
+ * 2. Streaming Input Mode - 多輪對話（生成器模式）
+ * 3. 自訂系統提示 - 完全控制 Agent 行為
+ * 4. 自訂 MCP 工具 - 建立自己的工具供 Agent 使用
+ * 5. 互動式對話 - 持續對話模式
  */
 
-// 1. 載入環境變數配置
-// dotenv/config 會自動讀取 .env 檔案並將其中的變數（如 ANTHROPIC_API_KEY）載入到 process.env
 import "dotenv/config";
-
-// 2. 導入 Claude Agent SDK 核心函數
-// query 是 SDK 的主要函數，用於與 Claude AI 進行對話和互動
 import { query } from "@anthropic-ai/claude-agent-sdk";
+import { customToolsServer } from "./mcpServers/customToolsServer.js";
 
-// 3. 導入 Node.js 內建的 readline 模組（Promise 版本）
-// 用於在終端機中讀取使用者的輸入
-import * as readline from "readline/promises";
-
-// 4. 建立 readline 介面
-// 設定標準輸入（stdin）和標準輸出（stdout），讓程式能與使用者互動
-const rl = readline.createInterface({
-  input: process.stdin,  // 從終端機讀取輸入
-  output: process.stdout, // 輸出到終端機
-});
+// ============================================
+// 輔助函數
+// ============================================
 
 /**
- * 異步生成器函數：產生使用者訊息
- *
- * 為什麼使用 async function*？
- * - async: 因為需要等待使用者輸入（非同步操作）
- * - function*: 生成器可以 yield 多個訊息，支援多輪對話
- *
- * 這個函數會：
- * 1. 等待使用者輸入問題
- * 2. 將輸入包裝成符合 SDK 要求的 SDKUserMessage 格式
- * 3. yield 出去給 query 函數使用
+ * 讀取使用者輸入
  */
-async function* generateMessages() {
-  // 等待使用者輸入（這是一個 Promise，會暫停直到使用者按下 Enter）
-  const userInput = await rl.question("請輸入你的問題: ");
+async function getInput(prompt: string = "請輸入: "): Promise<string> {
+  process.stdout.write(prompt);
+  process.stdin.resume();
+  process.stdin.setEncoding("utf8");
 
-  // 產生符合 SDK 格式的使用者訊息
-  yield {
-    type: "user" as const,  // 訊息類型：使用者訊息
-    message: {
-      role: "user" as const,  // 角色：使用者
-      content: userInput,      // 訊息內容：使用者輸入的文字
-    },
-    // parent_tool_use_id: 如果這個訊息是回應某個工具的執行結果，則填入該工具的 ID
-    // 這裡是 null 因為這是主動的使用者輸入，不是回應工具
-    parent_tool_use_id: null,
-
-    // session_id: 會話 ID，用於追蹤同一個對話
-    // 在實際應用中，可以用 UUID 或其他方式生成唯一 ID
-    session_id: "session_1",
-  };
+  return new Promise<string>((resolve) => {
+    process.stdin.once("data", (data) => {
+      const input = data.toString().trim();
+      process.stdin.pause();
+      resolve(input);
+    });
+  });
 }
 
-console.log("Starting Claude Agent SDK interactive example...\n");
-
 /**
- * 主要執行流程：處理串流回應
- *
- * for await...of 語法說明：
- * - query() 會回傳一個異步迭代器（AsyncIterator）
- * - 每當 AI 產生新的訊息（如思考、工具使用、回應等），都會產生一個 message
- * - for await 會自動處理這些異步訊息，逐一處理
+ * 印出訊息處理器（統一處理所有訊息類型）
  */
-for await (const message of query({
-  // prompt: 可以是字串或異步訊息生成器
-  // 使用生成器的好處是可以動態產生訊息，支援多輪對話
-  prompt: generateMessages(),
-
-  // options: 配置 Agent 的行為
-  options: {
-    // maxTurns: 限制最多執行幾輪對話
-    // 為什麼需要限制？防止 AI 進入無限循環，控制成本和執行時間
-    maxTurns: 10,
-
-    // allowedTools: 限制 AI 可以使用哪些工具
-    // 為什麼要限制？安全性考量，只開放必要的工具
-    // - Read: 讀取檔案
-    // - Glob: 搜尋檔案（使用 glob 模式）
-    // - Bash: 執行 shell 命令
-    // - Grep: 在檔案中搜尋內容
-    allowedTools: ["Read", "Glob", "Bash", "Grep"],
-  },
-})) {
-  /**
-   * 處理不同類型的訊息
-   *
-   * message.type 可能的值：
-   * - "system": 系統訊息
-   * - "user": 使用者訊息
-   * - "assistant": AI 助手的訊息
-   * - "result": 最終結果
-   */
-
-  // 處理最終結果
-  if (message.type === "result" && message.subtype === "success") {
-    console.log("\n=== 最終結果 ===");
-    console.log(message.result);
+function printMessage(message: any, verbose: boolean = false) {
+  if (verbose) {
+    console.log(`\n[訊息類型: ${message.type}]`);
   }
-  // 處理 AI 助手的回應
-  else if (message.type === "assistant") {
-    // message.content 是一個陣列，可能包含多種類型：
-    // - { type: "text", text: "..." }: 純文字內容
-    // - { type: "tool_use", ... }: 工具使用請求
-    // 這裡我們只提取並顯示文字內容
-    const textContent = message.message.content
-      .filter((c: any) => c.type === "text")  // 只保留文字類型的內容
-      .map((c: any) => c.text)                // 提取文字
-      .join("\n");                            // 合併成一個字串
 
-    // 只有在有文字內容時才顯示
+  // 助手回應
+  if (message.type === "assistant") {
+    const textContent = message.message.content
+      .filter((c: any) => c.type === "text")
+      .map((c: any) => c.text)
+      .join("\n");
+
     if (textContent) {
-      console.log("\n助手:", textContent);
+      console.log("\n🤖 助手:", textContent);
+    }
+
+    // 顯示工具使用
+    const toolUses = message.message.content.filter((c: any) => c.type === "tool_use");
+    if (toolUses.length > 0 && verbose) {
+      console.log("\n🔧 工具使用:");
+      toolUses.forEach((tool: any) => {
+        console.log(`   ${tool.name}(${JSON.stringify(tool.input)})`);
+      });
     }
   }
+
+  // 最終結果（含統計資訊）
+  if (message.type === "result" && message.subtype === "success") {
+    console.log("\n" + "=".repeat(60));
+    console.log("📊 執行統計");
+    console.log("=".repeat(60));
+    console.log(`⏱️  執行時間: ${message.duration_ms}ms (API: ${message.duration_api_ms}ms)`);
+    console.log(`🔄 對話輪數: ${message.num_turns}`);
+    console.log(`💰 總成本: $${message.total_cost_usd.toFixed(4)}`);
+    console.log(`📝 Token 使用: ${message.usage.input_tokens} in / ${message.usage.output_tokens} out`);
+    console.log("\n✅ 最終結果:");
+    console.log(message.result);
+  }
+
+  // 錯誤處理
+  if (message.type === "result" && message.subtype === "error") {
+    console.error("\n❌ 執行錯誤:", message.error);
+  }
 }
 
-// 關閉 readline 介面，釋放資源
-rl.close();
+// ============================================
+// 範例 1: 簡單查詢
+// ============================================
+async function runSimpleQuery() {
+  console.log("\n▶️  執行: 簡單查詢範例\n");
+
+  for await (const message of query({
+    prompt: "計算 (123 + 456) × 2 的結果",
+    options: {
+      maxTurns: 3,
+      allowedTools: ["Bash"],
+    }
+  })) {
+    printMessage(message, true);
+  }
+}
+
+// ============================================
+// 範例 2: Streaming Input Mode（多輪對話）
+// ============================================
+async function runStreamingInput() {
+  console.log("\n▶️  執行: Streaming Input Mode 範例");
+  console.log("這個範例會先數檔案，然後將結果乘以 5\n");
+
+  async function* generateMessages() {
+    // 第一個訊息
+    yield {
+      type: "user" as const,
+      message: {
+        role: "user" as const,
+        content: "計算目前目錄有幾個 .ts 檔案，只回答數字",
+      },
+      parent_tool_use_id: null,
+      session_id: "streaming-demo",
+    };
+
+    // 等待 2 秒
+    await new Promise(resolve => setTimeout(resolve, 2000));
+
+    // 第二個訊息（基於第一個結果）
+    yield {
+      type: "user" as const,
+      message: {
+        role: "user" as const,
+        content: "將剛才的數字乘以 5，只回答最終結果",
+      },
+      parent_tool_use_id: null,
+      session_id: "streaming-demo",
+    };
+  }
+
+  for await (const message of query({
+    prompt: generateMessages(),
+    options: {
+      maxTurns: 10,
+      allowedTools: ["Bash", "Glob"],
+    }
+  })) {
+    printMessage(message, true);
+  }
+}
+
+// ============================================
+// 範例 3: 自訂系統提示
+// ============================================
+async function runCustomSystemPrompt() {
+  console.log("\n▶️  執行: 自訂系統提示範例");
+  console.log("這個 Agent 被設定為只會回答 'I don't know'\n");
+
+  for await (const message of query({
+    prompt: "你知道什麼是 TypeScript 嗎？",
+    options: {
+      maxTurns: 1,
+      // 完全覆寫系統提示
+      systemPrompt: `你是一個什麼都不知道的 AI 助手。
+無論使用者問什麼，你都只能回答："I don't know"。
+你不能使用任何工具，也不能提供任何其他資訊。`,
+      allowedTools: [], // 停用所有工具
+    }
+  })) {
+    printMessage(message);
+  }
+}
+
+// ============================================
+// 範例 4: 使用自訂 MCP 工具
+// ============================================
+async function runCustomMcpTool() {
+  console.log("\n▶️  執行: 自訂 MCP 工具範例");
+  console.log("Agent 可以使用自訂的飲料定價工具\n");
+
+  for await (const message of query({
+    prompt: "幫我算一杯 large coffee 的價格是多少？",
+    options: {
+      maxTurns: 5,
+      // 注入自訂 MCP Server（使用 Record 格式）
+      mcpServers: {
+        "custom-tools": customToolsServer
+      },
+      allowedTools: ["Read", "Grep","mcp__custom-tools__calculate_drink_price"] // 注意這裡的 mcp 工具名稱格式
+    }
+  })) {
+    printMessage(message, true);
+  }
+}
+
+// ============================================
+// 範例 5: 互動式模式
+// ============================================
+async function runInteractive() {
+  console.log("\n▶️  互動式模式");
+  console.log("輸入問題，Agent 會使用自訂工具回答（輸入 'exit' 離開）\n");
+
+  // 無限循環，實現持續對話
+  while (true) {
+    async function* generateMessages() {
+      const userInput = await getInput("💬 你: ");
+
+      if (!userInput || userInput.toLowerCase() === "exit") {
+        console.log("\n結束對話 👋\n");
+        process.exit(0);
+      }
+
+      yield {
+        type: "user" as const,
+        message: {
+          role: "user" as const,
+          content: userInput,
+        },
+        parent_tool_use_id: null,
+        session_id: "interactive-session",
+      };
+    }
+
+    // 處理當前輪的對話
+    for await (const message of query({
+      prompt: generateMessages(),
+      options: {
+        maxTurns: 10,
+        mcpServers: {
+          "custom-tools": customToolsServer
+        },
+        allowedTools: ["Read", "Glob", "Bash", "Grep", "mcp__custom-tools__calculate_drink_price"], // 注意這裡的 mcp 工具名稱格式
+      }
+    })) {
+      printMessage(message, true);
+    }
+
+    // 對話結束後顯示分隔線，準備下一輪
+    console.log("\n" + "─".repeat(60) + "\n");
+  }
+}
+
+// ============================================
+// 互動式選單
+// ============================================
+async function showMenu() {
+  console.log(`
+╔════════════════════════════════════════════╗
+║   Claude Agent SDK 進階範例              ║
+╚════════════════════════════════════════════╝
+
+請選擇要執行的範例：
+
+  1. Simple Query         - 基本查詢範例
+  2. Streaming Input      - Streaming Input 多輪對話
+  3. Custom Prompt        - 自訂系統提示
+  4. MCP Tool             - 自訂 MCP 工具
+  5. Interactive Mode     - 互動式對話
+  0. Exit                 - 離開
+
+提示：你也可以直接執行 npm run demo:<模式>
+`);
+
+  const choice = await getInput("請輸入選項 (0-5): ");
+
+  switch (choice) {
+    case "1":
+      await runSimpleQuery();
+      break;
+    case "2":
+      await runStreamingInput();
+      break;
+    case "3":
+      await runCustomSystemPrompt();
+      break;
+    case "4":
+      await runCustomMcpTool();
+      break;
+    case "5":
+      await runInteractive();
+      break;
+    case "0":
+      console.log("\n再見！👋\n");
+      process.exit(0);
+    default:
+      console.log("\n⚠️  無效的選項，請重新選擇\n");
+      await showMenu();
+  }
+}
+
+// ============================================
+// 主程式
+// ============================================
+(async () => {
+  try {
+    // 如果有命令列參數，直接執行對應範例
+    const mode = process.argv[2];
+
+    if (mode) {
+      switch (mode) {
+        case "simple":
+          await runSimpleQuery();
+          break;
+        case "streaming":
+          await runStreamingInput();
+          break;
+        case "custom-prompt":
+          await runCustomSystemPrompt();
+          break;
+        case "mcp-tool":
+          await runCustomMcpTool();
+          break;
+        case "interactive":
+          await runInteractive();
+          break;
+        default:
+          console.log(`\n⚠️  未知模式: ${mode}\n`);
+          await showMenu();
+      }
+    } else {
+      // 沒有參數，顯示互動式選單
+      await showMenu();
+    }
+  } catch (error) {
+    console.error("\n❌ 發生錯誤:", error);
+    process.exit(1);
+  }
+})();
